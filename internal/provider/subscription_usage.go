@@ -245,16 +245,15 @@ func fetchSubscriptionUsage() []SubscriptionQuota {
 				fetches = append(fetches, withUser(p.Account.User, func() SubscriptionQuota { return codexSubscriptionUsage(viaLogin("codex", p.Account.User), auth) }))
 			}
 		}
-		cfg := os.Getenv("XDG_CONFIG_HOME")
-		if cfg == "" {
-			cfg = filepath.Join(home, ".config")
-		}
-		if app, ok := copilotLogin(cfg); ok && !hidden["copilot"] {
-			if ls := copilotLoginList(); len(ls) > 1 {
-				fetches = append(fetches, perLogin(via("copilot"), ls, "Copilot", "githubcopilot")...)
-			} else {
-				fetches = append(fetches, withUser(app.User, func() SubscriptionQuota { return copilotSubscriptionUsage(viaLogin("copilot", app.User), app.Token) }))
-			}
+		// Every Copilot account magpie knows, the editors' or the CLI's own
+		// sign-in or not: one signed in from magpie alone is enough
+		// (copilotLoginList reads both, copilot_accounts.go). Asking only
+		// when copilotLogin found the editors' token left an account magpie
+		// signed in itself without a card on the Usage page, and out of the
+		// gateway's GET /v1/magpie/quotas, however fresh its reading was
+		// (subscription_usage_test.go, TestCopilotQuotaWithoutEditorsSignIn).
+		if ls := copilotLoginList(); len(ls) > 0 && !hidden["copilot"] {
+			fetches = append(fetches, perLogin(via("copilot"), ls, "Copilot", "githubcopilot")...)
 		}
 	}
 	if moved("kiro") {
