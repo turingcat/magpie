@@ -110,3 +110,17 @@ func TestAddSecondOfPreset(t *testing.T) {
 		t.Fatalf("edit: %+v, %d providers", a, len(All()))
 	}
 }
+
+func TestSub2APIPreset(t *testing.T) {
+	p, err := FromPreset("sub2api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.ID != "sub2api" || p.Preset != "sub2api" || p.Chat != "" {
+		t.Fatalf("provider: %+v", p)
+	}
+	pr := Preset("sub2api")
+	if pr == nil || pr.Kind != KindRelay || pr.Endpoint == "" || pr.EndpointHint == "" {
+		t.Fatalf("preset: %+v", pr)
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,9 +22,10 @@ import (
 
 // planQuotaSource is where a provider's key tells its plan's windows.
 type planQuotaSource struct {
-	url    string
-	bearer bool // Zhipu takes the bare key as the Authorization
-	read   func(body []byte) (plan string, ws []QuotaWindow, err error)
+	url         string
+	bearer      bool // Zhipu takes the bare key as the Authorization
+	read        func(body []byte) (plan string, ws []QuotaWindow, err error)
+	readBalance func(body []byte) (string, error)
 	// sure is set when the provider is a plan and not just the vendor: a
 	// pay-as-you-go GLM key has no windows to tell, and saying so on a card
 	// would only be noise
@@ -31,33 +33,55 @@ type planQuotaSource struct {
 }
 
 func planQuotaSourceOf(p Provider) (planQuotaSource, bool) {
+	if p.Preset == "sub2api" {
+		for _, base := range []string{p.Chat, p.Responses, p.Anthropic} {
+			if usage, ok := sub2APIUsageURL(base); ok {
+				return planQuotaSource{url: usage, bearer: true, read: readSub2APIWindows, readBalance: readSub2APIBalance, sure: true}, true
+			}
+		}
+		return planQuotaSource{}, false
+	}
 	for _, base := range []string{p.Chat, p.Anthropic, p.Responses} {
 		coding := strings.Contains(base, "/api/coding/")
 		switch hostOf(base) {
 		case "open.bigmodel.cn":
-			return planQuotaSource{"https://open.bigmodel.cn/api/monitor/usage/quota/limit", false, readZhipuPlan, coding}, true
+			return planQuotaSource{url: "https://open.bigmodel.cn/api/monitor/usage/quota/limit", read: readZhipuPlan, sure: coding}, true
 		case "api.z.ai":
-			return planQuotaSource{"https://api.z.ai/api/monitor/usage/quota/limit", false, readZhipuPlan, coding}, true
+			return planQuotaSource{url: "https://api.z.ai/api/monitor/usage/quota/limit", read: readZhipuPlan, sure: coding}, true
 		case "api.kimi.com", "api.kimi.ai":
 			if strings.Contains(base, "/coding") {
-				return planQuotaSource{strings.TrimSuffix(kimiCodeBase(base), "/") + "/usages", true, readKimiCode, true}, true
+				return planQuotaSource{url: strings.TrimSuffix(kimiCodeBase(base), "/") + "/usages", bearer: true, read: readKimiCode, sure: true}, true
 			}
 		case "api.commandcode.ai":
 			// a plan's key, from Studio or its sign-in, works on the keyed
 			// preset too, and is told the plan's 5-hour and weekly windows;
 			// a pay-as-you-go key has none, and no card
-			return planQuotaSource{"https://api.commandcode.ai/alpha/billing/credits", true, readCommandCodePlan, false}, true
+			return planQuotaSource{url: "https://api.commandcode.ai/alpha/billing/credits", bearer: true, read: readCommandCodePlan}, true
 		case "api.minimaxi.com", "api.minimax.io":
 			// a Coding Plan key (sk-cp-…) is told its windows; a
 			// pay-as-you-go key isn't, and gets no card (#387)
-			return planQuotaSource{"https://" + hostOf(base) + "/v1/token_plan/remains", true, readMiniMaxPlan, false}, true
+			return planQuotaSource{url: "https://" + hostOf(base) + "/v1/token_plan/remains", bearer: true, read: readMiniMaxPlan}, true
 		case "opencode.ai":
 			if u := strings.TrimSuffix(base, "/"); strings.HasSuffix(u, "/zen/go") || strings.Contains(u, "/zen/go/") {
-				return planQuotaSource{"https://opencode.ai/zen/go/v1/usage", true, readOpenCodeGo, true}, true
+				return planQuotaSource{url: "https://opencode.ai/zen/go/v1/usage", bearer: true, read: readOpenCodeGo, sure: true}, true
 			}
 		}
 	}
 	return planQuotaSource{}, false
+}
+
+// sub2APIUsageURL derives a self-hosted sub2api usage URL from its configured
+// protocol base. The preset gate in planQuotaSourceOf keeps other custom
+// OpenAI-compatible providers from being probed.
+func sub2APIUsageURL(base string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(base))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", false
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/usage"
+	u.RawPath = ""
+	u.RawQuery, u.Fragment = "", ""
+	return u.String(), true
 }
 
 // readZhipuPlan reads
@@ -172,6 +196,75 @@ func readOpenCodeGo(b []byte) (string, []QuotaWindow, error) {
 		return "", nil, fmt.Errorf("no usage in the reply")
 	}
 	return "", out, nil
+}
+
+// readSub2APIWindows extracts the allowance windows from sub2api's
+// unrestricted /usage response.
+func readSub2APIWindows(b []byte) (string, []QuotaWindow, error) {
+	plan, ws, _, err := readSub2APIPlan(b)
+	return plan, ws, err
+}
+
+// readSub2APIBalance extracts the account balance from sub2api's /usage reply.
+func readSub2APIBalance(b []byte) (string, error) {
+	_, _, balance, err := readSub2APIPlan(b)
+	return balance, err
+}
+
+func readSub2APIPlan(b []byte) (string, []QuotaWindow, string, error) {
+	var r struct {
+		Plan   string   `json:"planName"`
+		Remain *float64 `json:"remaining"`
+		Unit   string   `json:"unit"`
+		Sub    *struct {
+			DailyUsage   float64  `json:"daily_usage_usd"`
+			DailyLimit   *float64 `json:"daily_limit_usd"`
+			WeeklyUsage  float64  `json:"weekly_usage_usd"`
+			WeeklyLimit  *float64 `json:"weekly_limit_usd"`
+			MonthlyUsage float64  `json:"monthly_usage_usd"`
+			MonthlyLimit *float64 `json:"monthly_limit_usd"`
+			WeeklyStart  string   `json:"weekly_window_start"`
+		} `json:"subscription"`
+	}
+	if err := json.Unmarshal(b, &r); err != nil {
+		return "", nil, "", err
+	}
+	balance := ""
+	if r.Remain != nil {
+		if strings.EqualFold(strings.TrimSpace(r.Unit), "USD") || strings.TrimSpace(r.Unit) == "" {
+			balance = fmt.Sprintf("$%.2f", *r.Remain)
+		} else {
+			balance = fmt.Sprintf("%.2f %s", *r.Remain, strings.TrimSpace(r.Unit))
+		}
+	}
+	var ws []QuotaWindow
+	if r.Sub != nil {
+		add := func(name string, used float64, limit *float64, span time.Duration) {
+			if limit == nil || *limit <= 0 {
+				return
+			}
+			pct := used / *limit * 100
+			pct = max(0, min(100, pct))
+			ws = append(ws, QuotaWindow{Name: name, Used: pct, Span: span})
+		}
+		add("24 hours", r.Sub.DailyUsage, r.Sub.DailyLimit, 24*time.Hour)
+		add("7 days", r.Sub.WeeklyUsage, r.Sub.WeeklyLimit, 7*24*time.Hour)
+		add("30 days", r.Sub.MonthlyUsage, r.Sub.MonthlyLimit, 30*24*time.Hour)
+		if len(ws) > 0 && r.Sub.WeeklyStart != "" {
+			if t, err := time.Parse(time.RFC3339Nano, r.Sub.WeeklyStart); err == nil {
+				for i := range ws {
+					if ws[i].Name == "7 days" {
+						reset := t.Add(7 * 24 * time.Hour)
+						ws[i].ResetsAt = &reset
+					}
+				}
+			}
+		}
+	}
+	if balance == "" && len(ws) == 0 {
+		return "", nil, "", fmt.Errorf("no balance or usage in the reply")
+	}
+	return r.Plan, ws, balance, nil
 }
 
 // readMiniMaxPlan reads MiniMax's /v1/token_plan/remains (#387):
@@ -385,10 +478,10 @@ func readKimiCode(b []byte) (string, []QuotaWindow, error) {
 }
 
 // planWindows asks the vendor for the plan key is on and its windows.
-func planWindows(ctx context.Context, src planQuotaSource, key string) (plan string, ws []QuotaWindow, err error) {
+func planWindows(ctx context.Context, src planQuotaSource, key string) (plan string, ws []QuotaWindow, balance string, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src.url, nil)
 	if err != nil {
-		return "", nil, err
+		return "", nil, "", err
 	}
 	if src.bearer {
 		req.Header.Set("Authorization", "Bearer "+key)
@@ -399,17 +492,24 @@ func planWindows(ctx context.Context, src planQuotaSource, key string) (plan str
 	req.Header.Set("Accept-Language", "en-US,en")
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", nil, err
+		return "", nil, "", err
 	}
 	defer res.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	switch {
 	case res.StatusCode == http.StatusForbidden && strings.Contains(src.url, "opencode.ai"):
-		return "", nil, fmt.Errorf("this key has no OpenCode Go subscription")
+		return "", nil, "", fmt.Errorf("this key has no OpenCode Go subscription")
 	case res.StatusCode >= 300:
-		return "", nil, fmt.Errorf("%s", res.Status)
+		return "", nil, "", fmt.Errorf("%s", res.Status)
 	}
-	return src.read(b)
+	plan, ws, err = src.read(b)
+	if err != nil {
+		return "", nil, "", err
+	}
+	if src.readBalance != nil {
+		balance, err = src.readBalance(b)
+	}
+	return plan, ws, balance, err
 }
 
 var planQuotaCache struct {
@@ -468,13 +568,13 @@ func PlanQuotas(ctx context.Context) []SubscriptionQuota {
 		go func() {
 			defer wg.Done()
 			q := SubscriptionQuota{Provider: j.p.ID, Name: j.p.Name, Icon: j.p.Icon, User: j.user, Windows: []QuotaWindow{}}
-			plan, ws, err := planWindows(j.p.Via(ctx), j.src, j.key)
+			plan, ws, balance, err := planWindows(j.p.Via(ctx), j.src, j.key)
 			team := false
 			if zhipu := strings.HasSuffix(j.src.url, "/api/monitor/usage/quota/limit"); zhipu && (err != nil || len(ws) == 0) {
 				// no plan of the key's own: a team's key, whose windows are
 				// asked with type=2 (zcode_team.go)
 				if tplan, tws, terr := zhipuKeyTeamWindows(j.p.Via(ctx), j.src.url, j.key, j.p.ZhipuTeam); terr == nil && len(tws) > 0 {
-					plan, ws, err, team = tplan, tws, nil, true
+					plan, ws, balance, err, team = tplan, tws, "", nil, true
 				}
 			}
 			// a vendor failing a while (Command Code answers billing/credits
@@ -482,7 +582,7 @@ func PlanQuotas(ctx context.Context) []SubscriptionQuota {
 			// card does, rather than no card or "Usage unavailable"
 			tag := keyTag("plan", j.key)
 			switch {
-			case err == nil && len(ws) == 0:
+			case err == nil && len(ws) == 0 && balance == "":
 				return // a key with no plan
 			case err != nil && !j.src.sure:
 				// no plan, unless one was read before
@@ -494,7 +594,7 @@ func PlanQuotas(ctx context.Context) []SubscriptionQuota {
 			case err != nil:
 				q.Error = err.Error()
 			default:
-				q.Plan, q.Windows = plan, ws
+				q.Plan, q.Windows, q.Balance = plan, ws, balance
 				if strings.HasSuffix(j.src.url, "/api/monitor/usage/quota/limit") && !team { // Zhipu, Z.ai
 					q.Until, q.Renew = zhipuTerm(ctx, zcodeRoot(j.src.url), j.key)
 				}

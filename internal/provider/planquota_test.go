@@ -31,6 +31,9 @@ func TestPlanQuotaSource(t *testing.T) {
 		{Provider{Chat: "https://api.commandcode.ai/provider/v1", Anthropic: "https://api.commandcode.ai/provider"}, "https://api.commandcode.ai/alpha/billing/credits", true, false},
 		{Provider{Chat: "https://api.minimaxi.com/v1", Anthropic: "https://api.minimaxi.com/anthropic"}, "https://api.minimaxi.com/v1/token_plan/remains", true, false},
 		{Provider{Anthropic: "https://api.minimax.io/anthropic"}, "https://api.minimax.io/v1/token_plan/remains", true, false},
+		{Provider{Preset: "sub2api", Chat: "https://self.example/v1"}, "https://self.example/v1/usage", true, true},
+		{Provider{Preset: "sub2api", Responses: "https://self.example/api/v1/"}, "https://self.example/api/v1/usage", true, true},
+		{Provider{Chat: "https://self.example/v1"}, "", false, false},
 		{Provider{Chat: "https://api.deepseek.com"}, "", false, false},
 	} {
 		src, ok := planQuotaSourceOf(c.p)
@@ -189,11 +192,11 @@ func TestPlanWindowsAuth(t *testing.T) {
 		w.Write([]byte(`{"success":true,"data":{"limits":[{"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":1}]}}`))
 	}))
 	defer srv.Close()
-	_, ws, err := planWindows(context.Background(), planQuotaSource{url: srv.URL + "/z", read: readZhipuPlan}, "k1")
+	_, ws, _, err := planWindows(context.Background(), planQuotaSource{url: srv.URL + "/z", read: readZhipuPlan}, "k1")
 	if err != nil || len(ws) != 1 || auth != "k1" {
 		t.Errorf("zhipu: %v %+v auth %q", err, ws, auth)
 	}
-	_, _, err = planWindows(context.Background(), planQuotaSource{url: srv.URL + "/go", bearer: true, read: readOpenCodeGo}, "k2")
+	_, _, _, err = planWindows(context.Background(), planQuotaSource{url: srv.URL + "/go", bearer: true, read: readOpenCodeGo}, "k2")
 	if err == nil || auth != "Bearer k2" {
 		t.Errorf("go: %v auth %q", err, auth)
 	}
@@ -312,5 +315,150 @@ func TestReadKimiCode(t *testing.T) {
 	}
 	if _, _, err := readKimiCode([]byte(`{"error":{"message":"bad key"}}`)); err == nil {
 		t.Fatal("nothing read")
+	}
+}
+
+func TestSub2APIUsageURL(t *testing.T) {
+	for _, tc := range []struct {
+		base, want string
+		ok         bool
+	}{
+		{"https://tflow.online/v1", "https://tflow.online/v1/usage", true},
+		{"https://relay.example/api/v1/", "https://relay.example/api/v1/usage", true},
+		{"", "", false},
+		{"not a url", "", false},
+	} {
+		got, ok := sub2APIUsageURL(tc.base)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("sub2APIUsageURL(%q) = %q, %v; want %q, %v", tc.base, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestReadSub2APIPlan(t *testing.T) {
+	body := []byte(`{"mode":"unrestricted","planName":"OpenAI-Max","remaining":104.89,"unit":"USD",
+		"subscription":{"daily_usage_usd":-2,"daily_limit_usd":100,
+		"weekly_usage_usd":250,"weekly_limit_usd":200,
+		"monthly_usage_usd":27.89,"monthly_limit_usd":500,
+		"weekly_window_start":"2026-10-01T06:50:40Z"}}`)
+	plan, ws, balance, err := readSub2APIPlan(body)
+	if err != nil || plan != "OpenAI-Max" || balance != "$104.89" || len(ws) != 3 {
+		t.Fatalf("%v %q %q %+v", err, plan, balance, ws)
+	}
+	if ws[0].Name != "24 hours" || ws[0].Span != 24*time.Hour || ws[0].Used != 0 {
+		t.Errorf("daily: %+v", ws[0])
+	}
+	if ws[1].Name != "7 days" || ws[1].Span != 7*24*time.Hour || ws[1].Used != 100 || ws[1].ResetsAt == nil {
+		t.Errorf("weekly: %+v", ws[1])
+	} else if !ws[1].ResetsAt.Equal(time.Date(2026, 10, 8, 6, 50, 40, 0, time.UTC)) {
+		t.Errorf("weekly reset: %v", ws[1].ResetsAt)
+	}
+	if ws[2].Name != "30 days" || ws[2].Span != 30*24*time.Hour || ws[2].Used != 5.578 {
+		t.Errorf("monthly: %+v", ws[2])
+	}
+
+	plan, ws, balance, err = readSub2APIPlan([]byte(`{"mode":"unrestricted","remaining":12.5,"unit":"USD"}`))
+	if err != nil || plan != "" || len(ws) != 0 || balance != "$12.50" {
+		t.Fatalf("wallet-only: %v %q %q %+v", err, plan, balance, ws)
+	}
+	if _, _, _, err := readSub2APIPlan([]byte(`{"remaining":1`)); err == nil {
+		t.Error("malformed JSON should fail")
+	}
+	if _, _, _, err := readSub2APIPlan([]byte(`{"mode":"unrestricted","subscription":{"daily_limit_usd":0}}`)); err == nil {
+		t.Error("empty quota should fail")
+	}
+}
+
+func TestPlanQuotasSub2API(t *testing.T) {
+	isolate(t)
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
+	t.Setenv("PATH", h)
+	for _, v := range agentenv.Vars {
+		t.Setenv(v, "")
+	}
+
+	var gotPath, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotAuth = r.URL.Path, r.Header.Get("Authorization")
+		if gotPath != "/v1/usage" || gotAuth != "Bearer sub-key" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Write([]byte(`{"mode":"unrestricted","planName":"Self-hosted","remaining":42.5,"unit":"USD",
+			"subscription":{"daily_usage_usd":1,"daily_limit_usd":10,
+			"weekly_usage_usd":2,"weekly_limit_usd":20,
+			"monthly_usage_usd":3,"monthly_limit_usd":30}}`))
+	}))
+	defer srv.Close()
+
+	old := http.DefaultClient.Transport
+	http.DefaultClient.Transport = rewrite{srv}
+	t.Cleanup(func() { http.DefaultClient.Transport = old })
+
+	if err := Save(Provider{ID: "self-sub2api", Name: "Self-hosted", Preset: "sub2api", Chat: srv.URL + "/v1", Key: "sub-key"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(Provider{ID: "ordinary", Name: "Ordinary", Chat: "https://ordinary.example/v1", Key: "ordinary-key"}); err != nil {
+		t.Fatal(err)
+	}
+	forgetPlanQuotas()
+	var cards []SubscriptionQuota
+	for _, q := range PlanQuotas(context.Background()) {
+		if q.Provider == "self-sub2api" {
+			cards = append(cards, q)
+		}
+	}
+	if gotPath != "/v1/usage" || gotAuth != "Bearer sub-key" {
+		t.Fatalf("request: path %q auth %q", gotPath, gotAuth)
+	}
+	if len(cards) != 1 {
+		t.Fatalf("cards: %+v", cards)
+	}
+	q := cards[0]
+	if q.Plan != "Self-hosted" || q.Balance != "$42.50" || len(q.Windows) != 3 {
+		t.Fatalf("quota: %+v", q)
+	}
+}
+
+func TestSub2APIPlanQuotaSourcePrefersResponsesBeforeAnthropic(t *testing.T) {
+	src, ok := planQuotaSourceOf(Provider{
+		Preset:    "sub2api",
+		Responses: "https://responses.example/api/v1",
+		Anthropic: "https://anthropic.example/messages",
+	})
+	if !ok || src.url != "https://responses.example/api/v1/usage" {
+		t.Fatalf("source: %+v, ok=%v", src, ok)
+	}
+}
+
+func TestSub2APIPlanWindowsErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		status     int
+		body       string
+		wantErrSub string
+	}{
+		{"http error", http.StatusBadGateway, `{"error":"upstream unavailable"}`, "502"},
+		{"non-json", http.StatusOK, "<html>temporarily unavailable</html>", "invalid character"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			_, _, _, err := planWindows(context.Background(), planQuotaSource{
+				url:    srv.URL + "/usage",
+				bearer: true,
+				read:   readSub2APIWindows,
+			}, "sub-key")
+			if err == nil || !strings.Contains(err.Error(), tc.wantErrSub) {
+				t.Fatalf("error = %v, want substring %q", err, tc.wantErrSub)
+			}
+		})
 	}
 }
