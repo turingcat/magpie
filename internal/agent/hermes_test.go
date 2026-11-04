@@ -55,8 +55,8 @@ func TestHermes(t *testing.T) {
 		t.Fatalf("config:\n%s", raw)
 	}
 	ids := map[string]bool{}
-	for _, x := range mp["models"].([]any) {
-		ids[x.(string)] = true
+	for id := range mp["models"].(map[string]any) {
+		ids[id] = true
 	}
 	if !ids["deepseek/pro"] || !ids["deepseek/flash"] {
 		t.Fatalf("models: %v", ids)
@@ -341,7 +341,7 @@ func TestHermesKeepsTheUsersSettings(t *testing.T) {
 					BaseURL string            `yaml:"base_url"`
 					APIKey  string            `yaml:"api_key"`
 					APIMode string            `yaml:"api_mode"`
-					Models  []string          `yaml:"models"`
+					Models  map[string]any    `yaml:"models"`
 				} `yaml:"providers"`
 			}
 			raw := readFile(p)
@@ -353,7 +353,7 @@ func TestHermesKeepsTheUsersSettings(t *testing.T) {
 				t.Errorf("%s: the user's settings not kept in %s:\n%s", when, p, raw)
 			}
 			if mp.BaseURL == "http://127.0.0.1:1/v1" || mp.APIKey == "" || mp.APIMode != "chat_completions" || mp.Headers["User-Agent"] != "hermes-agent" ||
-				slices.Contains(mp.Models, "gone/old") || !slices.Contains(mp.Models, "kimi/k3") {
+				mp.Models["gone/old"] != nil || mp.Models["kimi/k3"] == nil {
 				t.Errorf("%s: magpie's own parts not written in %s:\n%s", when, p, raw)
 			}
 		}

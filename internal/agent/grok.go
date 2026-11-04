@@ -3,7 +3,8 @@ package agent
 // Grok Build, xAI's grok CLI, keeps its settings in ~/.grok/config.toml (or
 // $GROK_HOME's): the model new sessions start with under [models] default,
 // and models of the user's own as [model."<id>"] tables. magpie adds one
-// such table per catalog model, named "magpie/<provider>/<model>", pointing
+// such table per catalog model, named by its public "<provider>/<model>" id,
+// with model_provider = "magpie" identifying its ownership. Each points
 // at the gateway with magpie's own key — a model with no key of its own
 // would be sent the user's xAI sign-in — so the catalog joins Grok's own
 // models in its /model picker.
@@ -17,16 +18,12 @@ package agent
 
 import (
 	"encoding/json"
-	"errors"
-	"io/fs"
-	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 
-	toml "github.com/pelletier/go-toml/v2"
 	"github.com/tidwall/gjson"
 
 	"github.com/yetone/magpie/internal/catalog"
@@ -38,31 +35,23 @@ import (
 // grokEfforts are the reasoning efforts Grok knows.
 var grokEfforts = []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 
-// grokModelTable is the header prefix of every table magpie writes.
-var grokModelTable = `model."` + magpieID + "/"
+const grokProviderTable = "model_providers." + magpieID
 
-// grokModelTables are magpie's model tables, for a Grok that reaches the
-// gateway's /v1 at v1, and the context_window magpie gives each model (by
-// its catalog id), which the caller stashes. A context_window the user set
-// in a table themselves (grokOwnWindow: had is what the tables hold now,
-// wrote what magpie last gave them, nil before magpie kept a record) stays
-// as they set it.
-func grokModelTables(v1 string, had, wrote map[string]int) ([]edit.Table, map[string]int) {
+// grokModelTables builds canonical model tables using the windows already
+// merged with durable user ownership by grokKeptWindows.
+func grokModelTables(v1 string, models []catalog.Model, windows map[string]int) []edit.Table {
 	var out []edit.Table
-	st, gave := settings.Load(), map[string]int{}
-	for _, m := range sharedModels("grok") {
+	for _, m := range models {
 		kvs := []edit.KV{
 			{Path: "model", Value: m.ID},
+			{Path: "model_provider", Value: magpieID},
 			{Path: "name", Value: m.Name},
 			{Path: "base_url", Value: v1},
 			{Path: "api_key", Value: keyAt(v1)},
 			{Path: "api_backend", Value: grokBackend(m)},
 		}
-		if w := grokWindow(st, m); w > 0 {
-			gave[m.ID] = w
-			if n, ok := grokOwnWindow(m, w, had, wrote); ok {
-				w = n
-			}
+		w := windows[m.ID]
+		if w > 0 {
 			kvs = append(kvs, edit.KV{Path: "context_window", Value: w})
 		}
 		var efforts []string
@@ -74,9 +63,9 @@ func grokModelTables(v1 string, had, wrote map[string]int) ([]edit.Table, map[st
 		if len(efforts) > 0 {
 			kvs = append(kvs, edit.KV{Path: "reasoning_efforts", Value: edit.Raw("[" + strings.Join(efforts, ", ") + "]")})
 		}
-		out = append(out, edit.Table{Name: "model." + strconv.Quote(magpieID+"/"+m.ID), KVs: kvs})
+		out = append(out, edit.Table{Name: "model." + strconv.Quote(m.ID), KVs: kvs})
 	}
-	return out, gave
+	return out
 }
 
 // grokWindow is the context_window Grok Build is told for m. Grok Build
@@ -95,52 +84,6 @@ func grokWindow(st settings.Settings, m catalog.Model) int {
 		return min(c, m.Compact)
 	}
 	return st.Working(c)
-}
-
-// grokOwnWindow is a context_window the user set in magpie's table for m
-// themselves, which a sync keeps: one other than magpie last gave it. With
-// no record of magpie's (wrote nil, a config an older magpie wrote, or a
-// model new to the record), one other than the model's whole window, which
-// an older magpie wrote, and other than w, which magpie gives it now.
-func grokOwnWindow(m catalog.Model, w int, had, wrote map[string]int) (int, bool) {
-	n, ok := had[m.ID]
-	if !ok || n <= 0 || n == w {
-		return 0, false
-	}
-	if prev, ok := wrote[m.ID]; ok {
-		return n, n != prev
-	}
-	return n, n != m.Context
-}
-
-// grokWindowsIn is the context_window of each of magpie's model tables in
-// the config at path, by catalog id. A config that isn't there has none; one
-// that doesn't parse is an error, so a sync writes nothing over it.
-func grokWindowsIn(path string) (map[string]int, error) {
-	b, err := os.ReadFile(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var doc struct {
-		Model map[string]map[string]any `toml:"model"`
-	}
-	if err := toml.Unmarshal(b, &doc); err != nil {
-		return nil, err
-	}
-	out := map[string]int{}
-	for name, t := range doc.Model {
-		id, ok := strings.CutPrefix(name, magpieID+"/")
-		if !ok {
-			continue
-		}
-		if n, ok := t["context_window"].(int64); ok {
-			out[id] = int(n)
-		}
-	}
-	return out, nil
 }
 
 // grokBackend is the api_backend a model of magpie's is asked on: the API
@@ -175,47 +118,120 @@ func grokIn(at place) *Agent {
 		models, err := edit.GetTOMLTable(path, "models")
 		return models[k], err
 	}
+	keyModels := "grok:" + path + ":models"
+	keyProvider := "grok:" + path + ":provider"
+	var a *Agent
+	known := func() string {
+		if a != nil {
+			return appliedOf(a.ID).Fields["model"]
+		}
+		return ""
+	}
+	modelValue := func() string {
+		v, err := get("default")
+		if err != nil || v == "" || prefixed(v) {
+			return v
+		}
+		t, err := grokModelIn(path, v)
+		if err == nil && (t["model_provider"] == magpieID || t == nil && grokRecordedModel(path, v)) {
+			return magpieID + "/" + v
+		}
+		return v
+	}
 	wired := func() (bool, error) {
-		tables, err := edit.TOMLTables(path)
-		if err != nil {
-			return false, err
-		}
-		for _, t := range tables {
-			if strings.HasPrefix(t, grokModelTable) {
-				return true, nil
-			}
-		}
-		return false, nil
+		cfg, err := grokConfigIn(path, known())
+		return len(cfg.owned) > 0, err
 	}
 	// keyWindows is the context_window magpie last gave each of its models,
 	// so one the user set by hand since is told from it and kept
 	keyWindows := "grok:" + path + ":windows"
-	writeMagpie := func() error {
-		had, err := grokWindowsIn(path)
+	writeMagpie := func() (stashChanges, error) {
+		cfg, err := grokConfigIn(path, known())
 		if err != nil {
-			return err
+			return nil, err
 		}
-		var wrote map[string]int
-		saved := stashShared()[keyWindows]
-		if saved != "" {
-			json.Unmarshal([]byte(saved), &wrote)
+		models := sharedModels("grok")
+		windows, record := grokKeptWindows(path, cfg, models)
+		tables := grokModelTables(at.v1(), models, windows)
+		ids := make([]string, 0, len(tables))
+		for _, m := range models {
+			if _, exists := cfg.models[m.ID]; exists && cfg.owned[m.ID] != m.ID {
+				return nil, grokModelCollision(path, m.ID)
+			}
+			ids = append(ids, m.ID)
 		}
-		tables, gave := grokModelTables(at.v1(), had, wrote)
-		if err := edit.SetTOMLTables(path, []string{grokModelTable}, tables); err != nil {
-			return err
+		def, err := get("default")
+		if err != nil {
+			return nil, err
 		}
-		if !maps.Equal(gave, wrote) || saved == "" {
-			b, _ := json.Marshal(gave)
-			stash(map[string]string{keyWindows: string(b)})
+		selected := cfg.owned[def]
+		if selected == "" && cfg.models[def] == nil && grokRecordedModel(path, def) {
+			selected = def
 		}
-		return nil
+		registered := slices.Clone(ids)
+		if selected != "" && !slices.Contains(registered, selected) {
+			// Keep the field's identity until Reseat moves it; dropping
+			// its table must not make it look like a native Grok model.
+			registered = append(registered, selected)
+		}
+		cache, err := grokPrunedCache(dir, cfg.aliases(ids))
+		if err != nil {
+			return nil, err
+		}
+		// Every model carries its own endpoint and protocol. The named
+		// provider is Grok's native ownership relationship; an empty
+		// definition is sufficient, and existing user provider keys stay.
+		if cfg.provider == "" {
+			tables = append([]edit.Table{{Name: grokProviderTable}}, tables...)
+		}
+		if cfg.renamed != nil {
+			if err := edit.WriteTOMLFile(path, edit.SplitLines(string(cfg.renamed))); err != nil {
+				return nil, err
+			}
+		}
+		if err := edit.SetTOMLTablesMatching(path, cfg.syncNames(ids), nil, tables); err != nil {
+			return nil, err
+		}
+		if cfg.owned[def] != "" && def != cfg.owned[def] {
+			if err := edit.SetTOMLKey(path, "models", "default", cfg.owned[def]); err != nil {
+				return nil, err
+			}
+		}
+		if cache != nil {
+			if err := edit.WriteAtomic(filepath.Join(dir, "models_cache.json"), cache); err != nil {
+				return nil, err
+			}
+		}
+		pending := stashChanges{keyWindows: record}
+		if cfg.provider == "" {
+			pending[keyProvider] = "1"
+		}
+		b, _ := json.Marshal(registered)
+		pending[keyModels] = string(b)
+		return pending, nil
 	}
-	dropMagpie := func() error {
-		if err := edit.SetTOMLTables(path, []string{grokModelTable}, nil); err != nil {
-			return err
+	dropMagpie := func() (stashChanges, error) {
+		cfg, err := grokConfigIn(path, known())
+		if err != nil {
+			return nil, err
 		}
-		forget(keyWindows)
-		return nil
+		cache, err := grokPrunedCache(dir, cfg.aliases(nil))
+		if err != nil {
+			return nil, err
+		}
+		names := cfg.dropNames()
+		if cfg.providerEmpty && stashShared()[keyProvider] == "1" {
+			names = append(names, cfg.provider)
+		}
+		if err := edit.SetTOMLTablesMatching(path, names, nil, nil); err != nil {
+			return nil, err
+		}
+		if cache != nil {
+			if err := edit.WriteAtomic(filepath.Join(dir, "models_cache.json"), cache); err != nil {
+				return nil, err
+			}
+		}
+		return stashChanges{keyWindows: "", keyModels: "", keyProvider: ""}, nil
 	}
 	// the default model is the user's, not a campaign's
 	ownDefault := func(features map[string]string) error {
@@ -232,7 +248,7 @@ func grokIn(at place) *Agent {
 		}
 		return catalog.Efforts(magpieModels("grok"), ref)
 	}
-	return atomic(&Agent{
+	a = &Agent{
 		ID: "grok", Name: "Grok Build", Icon: "xai", Aliases: []string{"grok-build", "grok-cli"}, Spelled: prefixed,
 		UA:  []string{"grok-shell", "grok-pager", "xai-grok-build"}, // grok-pager: its terminal front end
 		Dir: dir, Path: path,
@@ -254,7 +270,11 @@ func grokIn(at place) *Agent {
 					return err
 				}
 			}
-			return writeMagpie()
+			pending, err := writeMagpie()
+			if err != nil {
+				return err
+			}
+			return stashUpdate(pending)
 		},
 		Notice: func() string {
 			if Running(`(^|/)grok( |$)`) {
@@ -267,15 +287,24 @@ func grokIn(at place) *Agent {
 			if err != nil {
 				return err.Error()
 			}
-			if !usesMagpie(v) {
+			if !usesMagpie(modelValue()) {
 				return ""
 			}
-			t, err := edit.GetTOMLTable(path, "model."+strconv.Quote(v))
+			t, err := grokModelIn(path, v)
 			if err != nil {
 				return err.Error()
 			}
 			if t == nil {
 				return "Grok Build's [model." + strconv.Quote(v) + "] (config.toml) is gone, so it no longer reaches magpie"
+			}
+			if t["model_provider"] == magpieID {
+				cfg, err := grokConfigIn(path, known())
+				if err != nil {
+					return err.Error()
+				}
+				if cfg.provider == "" {
+					return "Grok Build's [" + grokProviderTable + "] (config.toml) is gone, so it no longer reaches magpie"
+				}
 			}
 			return wiringOff("Grok Build", path, func(k string) (string, bool) { v, ok := t[k]; return v, ok },
 				"base_url", at.v1(), "api_key", at.gwKey())
@@ -283,8 +312,11 @@ func grokIn(at place) *Agent {
 		Fields: []Field{
 			{
 				Key: "model", Label: "model",
-				Get: func() string { v, _ := get("default"); return v },
+				Get: modelValue,
 				Set: func(v string) error {
+					if _, err := grokConfigIn(path, known()); err != nil {
+						return err
+					}
 					e, err := get("default_reasoning_effort")
 					if err != nil {
 						return err
@@ -300,21 +332,31 @@ func grokIn(at place) *Agent {
 						if err := edit.DelTOMLKey(path, "features", "campaigns"); err != nil {
 							return err
 						}
-						return dropMagpie()
-					}
-					if ref, ok := strings.CutPrefix(v, magpieID+"/"); ok && isMagpie(ref) {
-						if err := writeMagpie(); err != nil {
+						pending, err := dropMagpie()
+						if err != nil {
 							return err
 						}
-					} else if err := dropMagpie(); err != nil {
-						return err
+						return stashUpdate(pending)
+					}
+					var pending stashChanges
+					if ref, ok := strings.CutPrefix(v, magpieID+"/"); ok && isMagpie(ref) {
+						var err error
+						if pending, err = writeMagpie(); err != nil {
+							return err
+						}
+						v = ref
+					} else {
+						var err error
+						if pending, err = dropMagpie(); err != nil {
+							return err
+						}
 					}
 					if e != "" {
 						// a model without the chosen effort starts at its
 						// nearest one (a tie goes up), not at Grok's default:
 						// switching to a group of low/medium/high from xhigh
 						// keeps high (Creat.wu on Discord)
-						if es := efforts(v); es != nil && !contains(es, e) {
+						if es := efforts(magpieID + "/" + v); es != nil && !contains(es, e) {
 							if n := catalog.NearestEffort(e, es); contains(es, n) {
 								if err := edit.SetTOMLKey(path, "models", "default_reasoning_effort", n); err != nil {
 									return err
@@ -327,7 +369,10 @@ func grokIn(at place) *Agent {
 					if err := ownDefault(features); err != nil {
 						return err
 					}
-					return edit.SetTOMLKey(path, "models", "default", v)
+					if err := edit.SetTOMLKey(path, "models", "default", v); err != nil {
+						return err
+					}
+					return stashUpdate(pending)
 				},
 				Options: func(cur map[string]string) []Option {
 					// magpie's rows for the account Grok Build is signed in
@@ -346,6 +391,9 @@ func grokIn(at place) *Agent {
 				Key: "effort", Label: "effort",
 				Get: func() string { v, _ := get("default_reasoning_effort"); return v },
 				Set: func(v string) error {
+					if _, err := grokConfigIn(path, known()); err != nil {
+						return err
+					}
 					if v == "" {
 						return edit.DelTOMLKey(path, "models", "default_reasoning_effort")
 					}
@@ -359,7 +407,8 @@ func grokIn(at place) *Agent {
 				},
 			},
 		},
-	}, path)
+	}
+	return atomic(a, path, filepath.Join(dir, "models_cache.json"))
 }
 
 // grokOwnOptions are the models Grok Build offers its signed-in account: as
@@ -371,9 +420,17 @@ func grokIn(at place) *Agent {
 // subscription was signed in in magpie (EZN7L2C3, #834).
 func grokOwnOptions(dir, path, cur string) []Option {
 	seen := map[string]bool{}
+	managed := map[string]bool{}
+	if path != "" {
+		if cfg, err := grokConfigIn(path, ""); err == nil {
+			for id := range cfg.owned {
+				managed[id] = true
+			}
+		}
+	}
 	var out []Option
 	add := func(id, name, direct string) {
-		if id == "" || seen[id] || strings.HasPrefix(id, magpieID+"/") {
+		if id == "" || seen[id] || managed[id] || strings.HasPrefix(id, magpieID+"/") {
 			return
 		}
 		seen[id] = true
@@ -402,12 +459,9 @@ func grokOwnOptions(dir, path, cur string) []Option {
 	if path != "" {
 		if tables, err := edit.TOMLTables(path); err == nil {
 			for _, t := range tables {
-				id, ok := strings.CutPrefix(t, "model.")
+				id, ok := grokTableID(t, "model")
 				if !ok {
 					continue
-				}
-				if u, err := strconv.Unquote(id); err == nil {
-					id = u
 				}
 				kv, _ := edit.GetTOMLTable(path, t)
 				direct := "xAI"
