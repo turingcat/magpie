@@ -11,7 +11,9 @@ import (
 	toml "github.com/pelletier/go-toml/v2"
 	"github.com/pelletier/go-toml/v2/unstable"
 
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // grokConfig identifies actual ordinary model tables, retaining their exact
@@ -21,6 +23,8 @@ type grokConfig struct {
 	headers       map[string]string
 	owned         map[string]string // registered id -> public catalog id
 	children      []string
+	childIDs      map[string]string
+	movedChildren map[string]string
 	reasoning     []string
 	renamed       []byte
 	provider      string
@@ -28,7 +32,7 @@ type grokConfig struct {
 }
 
 func grokConfigIn(path, known string) (grokConfig, error) {
-	cfg := grokConfig{headers: map[string]string{}, owned: map[string]string{}}
+	cfg := grokConfig{headers: map[string]string{}, owned: map[string]string{}, childIDs: map[string]string{}, movedChildren: map[string]string{}}
 	headers, err := edit.TOMLTables(path)
 	if err != nil {
 		return cfg, err
@@ -111,6 +115,12 @@ func grokConfigIn(path, known string) (grokConfig, error) {
 		}
 		name := strings.Join(spelled, ".")
 		cfg.children = append(cfg.children, name)
+		cfg.childIDs[name] = ref
+		moved := append([]string(nil), spelled...)
+		if ref != parts[1] {
+			moved[1] = strconv.Quote(ref)
+		}
+		cfg.movedChildren[name] = strings.Join(moved, ".")
 		if parts[2] == "reasoning_efforts" {
 			cfg.reasoning = append(cfg.reasoning, name)
 		} else if ref != parts[1] {
@@ -188,6 +198,17 @@ func (cfg grokConfig) dropNames() []string {
 	return slices.Compact(out)
 }
 
+func (cfg grokConfig) syncNames(ids []string) []string {
+	out := cfg.names()
+	for _, child := range cfg.children {
+		if !slices.Contains(ids, cfg.childIDs[child]) {
+			out = append(out, child, cfg.movedChildren[child])
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
 func (cfg grokConfig) windows() map[string]int {
 	out := map[string]int{}
 	for id, ref := range cfg.owned {
@@ -209,10 +230,78 @@ func grokRecordedModel(path, id string) bool {
 	if slices.Contains(ids, id) {
 		return true
 	}
+	raw := stashShared()["grok:"+path+":windows"]
+	if record, known := catalogOwnershipIn(raw); known {
+		_, ok := record.Generated[id]
+		return ok
+	}
 	var windows map[string]int
-	json.Unmarshal([]byte(stashShared()["grok:"+path+":windows"]), &windows)
+	if json.Unmarshal([]byte(raw), &windows) != nil {
+		return false
+	}
 	_, ok := windows[id]
 	return ok
+}
+
+func grokKeptWindows(path string, cfg grokConfig, models []catalog.Model) (map[string]int, string) {
+	have, want := map[string]map[string]any{}, map[string]map[string]any{}
+	for _, id := range cfg.owned {
+		have[id] = map[string]any{}
+	}
+	for id, n := range cfg.windows() {
+		have[id]["context_window"] = n
+	}
+	st := settings.Load()
+	for _, model := range models {
+		next := map[string]any{}
+		if n := grokWindow(st, model); n > 0 {
+			next["context_window"] = n
+		}
+		want[model.ID] = next
+	}
+	raw := stashShared()["grok:"+path+":windows"]
+	previous, known := catalogOwnershipIn(raw)
+	if !known {
+		var legacy map[string]int
+		if raw != "" && json.Unmarshal([]byte(raw), &legacy) == nil && legacy != nil {
+			previous.Generated = map[string]map[string]any{}
+			for _, model := range models {
+				entry := map[string]any{}
+				if n := legacy[model.ID]; n > 0 {
+					entry["context_window"] = n
+				}
+				previous.Generated[model.ID] = entry
+			}
+			known = true
+		} else if raw == "" {
+			// Before window records, legacy aliases were generated with the
+			// complete catalog window. Preserve that upgrade rule without
+			// claiming an unrecorded canonical table as generated.
+			previous.Generated = map[string]map[string]any{}
+			for _, model := range models {
+				if cfg.owned[magpieID+"/"+model.ID] == model.ID {
+					entry := map[string]any{}
+					if model.Context > 0 {
+						entry["context_window"] = model.Context
+					}
+					previous.Generated[model.ID] = entry
+				}
+			}
+			known = true
+		}
+	}
+	merged, record := keepCatalogMetadata(have, want, previous, known, "context_window")
+	windows := map[string]int{}
+	for id, entry := range merged {
+		switch value := entry["context_window"].(type) {
+		case int:
+			windows[id] = value
+		case int64:
+			windows[id] = int(value)
+		}
+	}
+	data, _ := json.Marshal(record)
+	return windows, string(data)
 }
 
 func grokModelCollision(path, id string) error {

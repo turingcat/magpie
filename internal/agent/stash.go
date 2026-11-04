@@ -51,7 +51,9 @@ func stashShared() map[string]string {
 func stashRead(read func(kind, path string, parse func([]byte) (map[string]string, error)) (map[string]string, error)) map[string]string {
 	m, _ := read("stash", stashPath(), func(b []byte) (map[string]string, error) {
 		out := map[string]string{}
-		json.Unmarshal(b, &out)
+		if err := json.Unmarshal(b, &out); err != nil {
+			return nil, err
+		}
 		return out, nil
 	})
 	return m
@@ -86,6 +88,15 @@ func stashWrite(m map[string]string) error {
 }
 
 func stash(kv map[string]string) {
+	_ = stashUpdate(kv)
+}
+
+// stashUpdate commits one operation's changes against the latest shared stash.
+// Callers that tie ownership to config writes must propagate its error.
+func stashUpdate(kv map[string]string) error {
+	if len(kv) == 0 {
+		return nil
+	}
 	stashMu.Lock()
 	defer stashMu.Unlock()
 	m := stashLoad()
@@ -96,7 +107,30 @@ func stash(kv map[string]string) {
 			m[k] = v
 		}
 	}
-	stashWrite(m)
+	return stashWrite(m)
+}
+
+// stashChanges is an operation-local overlay. No shared state changes until
+// commit, so a config rollback cannot erase another agent's concurrent writes.
+type stashChanges map[string]string
+
+func (s stashChanges) get(key string) string {
+	if value, ok := s[key]; ok {
+		return value
+	}
+	return stashShared()[key]
+}
+
+func (s stashChanges) put(values map[string]string) {
+	for key, value := range values {
+		s[key] = value
+	}
+}
+
+func (s stashChanges) take(key string) string {
+	value := s.get(key)
+	s[key] = ""
+	return value
 }
 
 // forget drops stashed values without restoring them.
