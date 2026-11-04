@@ -49,9 +49,9 @@ func TestGrok(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw := read()
-	m := table(`model."magpie/deepseek/pro"`)
+	m := table(`model."deepseek/pro"`)
 	if m["model"] != "deepseek/pro" || m["api_key"] != "magpie" || !strings.HasSuffix(m["base_url"], "/v1") ||
-		m["api_backend"] != "chat_completions" || table(`model."magpie/deepseek/flash"`) == nil {
+		m["api_backend"] != "chat_completions" || table(`model."deepseek/flash"`) == nil {
 		t.Fatalf("tables:\n%s", raw)
 	}
 	// a campaign of xAI's would set the default over it
@@ -71,7 +71,7 @@ func TestGrok(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw = read()
-	if n := strings.Count(raw, `[model."magpie/deepseek/pro"]`); n != 1 {
+	if n := strings.Count(raw, `[model."deepseek/pro"]`); n != 1 {
 		t.Fatalf("%d tables:\n%s", n, raw)
 	}
 
@@ -80,7 +80,7 @@ func TestGrok(t *testing.T) {
 	if err := a.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(read(), `"magpie/deepseek/pro"]`) {
+	if strings.Contains(read(), `"deepseek/pro"]`) {
 		t.Fatalf("stale:\n%s", read())
 	}
 
@@ -286,7 +286,7 @@ func TestGrokAsksEachModelNatively(t *testing.T) {
 	}
 	raw, _ := os.ReadFile(path)
 	for id, want := range map[string]string{"deepseek/pro": "chat_completions", "resp/gpt-6-sol": "responses", "anth/claude-sonnet-5": "messages"} {
-		m, err := edit.GetTOMLTable(path, `model."magpie/`+id+`"`)
+		m, err := edit.GetTOMLTable(path, `model."`+id+`"`)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -316,10 +316,11 @@ func grokSandbox(t *testing.T) (string, string) {
 // grokWindows is the context_window of magpie's tables for pro and flash.
 func grokWindows(t *testing.T, path string) (int, int) {
 	t.Helper()
-	got, err := grokWindowsIn(path)
+	cfg, err := grokConfigIn(path, "")
 	if err != nil {
 		t.Fatal(err)
 	}
+	got := cfg.windows()
 	return got["deepseek/pro"], got["deepseek/flash"]
 }
 
@@ -336,7 +337,7 @@ func TestGrokKeepsAWindowSetByHand(t *testing.T) {
 	if pro, flash := grokWindows(t, path); pro != 1000000 || flash != 200000 {
 		t.Fatalf("magpie's windows: pro %d, flash %d", pro, flash)
 	}
-	if err := edit.SetTOMLKey(path, `model."magpie/deepseek/pro"`, "context_window", 300000); err != nil {
+	if err := edit.SetTOMLKey(path, `model."deepseek/pro"`, "context_window", 300000); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.Sync(); err != nil {
