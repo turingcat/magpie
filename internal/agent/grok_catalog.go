@@ -116,14 +116,13 @@ func grokConfigIn(path, known string) (grokConfig, error) {
 		name := strings.Join(spelled, ".")
 		cfg.children = append(cfg.children, name)
 		cfg.childIDs[name] = ref
-		moved := append([]string(nil), spelled...)
-		if ref != parts[1] {
-			moved[1] = strconv.Quote(ref)
-		}
-		cfg.movedChildren[name] = strings.Join(moved, ".")
+		cfg.movedChildren[name] = name
 		if parts[2] == "reasoning_efforts" {
 			cfg.reasoning = append(cfg.reasoning, name)
 		} else if ref != parts[1] {
+			moved := append([]string(nil), spelled...)
+			moved[1] = strconv.Quote(ref)
+			cfg.movedChildren[name] = strings.Join(moved, ".")
 			replacements = append(replacements, replacement{
 				int(modelKey.Offset), int(modelKey.Offset + modelKey.Length), strconv.Quote(ref),
 			})

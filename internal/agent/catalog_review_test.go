@@ -449,3 +449,46 @@ func TestHermesCatalogNormalizesOffWithoutInventingLevels(t *testing.T) {
 		t.Fatalf("an unknown/empty effort list must stay explicitly empty: present %v, %v", present, got)
 	}
 }
+
+func TestGrokRemovedAliasKeepsUnownedCanonicalReasoning(t *testing.T) {
+	home, path := grokSandbox(t)
+	const input = `[models]
+default = "magpie/deepseek/pro"
+
+[model."magpie/deepseek/pro"]
+model = "deepseek/pro"
+api_key = "magpie"
+
+[[model."magpie/deepseek/pro".reasoning_efforts]]
+value = "high"
+label = "Old managed High"
+
+[model."deepseek/pro"]
+model = "my-private-model"
+base_url = "https://native.example/v1"
+api_key = "user-private-key"
+
+[[model."deepseek/pro".reasoning_efforts]]
+value = "max"
+label = "My Max"
+`
+	grokCatalogWrite(t, path, input)
+	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek",
+		Chat: "http://127.0.0.1:1/v1", Key: "k", Models: []string{"flash"}}); err != nil {
+		t.Fatal(err)
+	}
+	err := grok(home).Sync()
+	// Refusing a collision is valid too; either result must preserve the
+	// complete unowned table, including the user's reasoning metadata.
+	models, _ := grokCatalogConfig(t, path)["model"].(map[string]any)
+	model, _ := models["deepseek/pro"].(map[string]any)
+	levels, ok := model["reasoning_efforts"].([]any)
+	if !ok || len(levels) != 1 {
+		t.Fatalf("removed alias cleanup deleted unowned reasoning metadata (sync error %v): %v", err, model)
+	}
+	level, _ := levels[0].(map[string]any)
+	if level["value"] != "max" || level["label"] != "My Max" ||
+		model["model"] != "my-private-model" || model["base_url"] != "https://native.example/v1" || model["api_key"] != "user-private-key" {
+		t.Fatalf("removed alias cleanup changed the unowned canonical model (sync error %v): %v", err, model)
+	}
+}
