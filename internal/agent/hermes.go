@@ -98,7 +98,7 @@ func hermesIn(at place) *Agent {
 		return edit.SetYAML(path, kvs...)
 	}
 	a := &Agent{
-		ID: "hermes", Name: "Hermes Agent", Icon: "hermes", Aliases: []string{"hermes-agent"}, Spelled: prefixed, NoNames: true,
+		ID: "hermes", Name: "Hermes Agent", Icon: "hermes", Aliases: []string{"hermes-agent"}, Spelled: prefixed,
 		UA:  []string{"hermes-agent"},
 		Bin: "hermes", Dir: dir, Path: path,
 		Sync: func() error {
@@ -602,25 +602,21 @@ func hermesBack(at place, dir, ref string) error {
 }
 
 type hermesProviderEntry struct {
-	Name    string            `yaml:"name"`
-	BaseURL string            `yaml:"base_url"`
-	APIKey  string            `yaml:"api_key"`
-	APIMode string            `yaml:"api_mode"`
-	Headers map[string]string `yaml:"extra_headers"`
-	Models  []string          `yaml:"models"`
+	Name    string                    `yaml:"name"`
+	BaseURL string                    `yaml:"base_url"`
+	APIKey  string                    `yaml:"api_key"`
+	APIMode string                    `yaml:"api_mode"`
+	Headers map[string]string         `yaml:"extra_headers"`
+	Models  map[string]map[string]any `yaml:"models"`
 }
 
 // hermesProviderAt is magpie's entry under providers, for a Hermes reaching
 // the gateway at gw. Hermes sends its own User-Agent only from a recent
 // release on, so the header names it for the gateway's usage view.
 func hermesProviderAt(gw string) hermesProviderEntry {
-	ms := []string{}
-	for _, m := range sharedModels("hermes") {
-		ms = append(ms, m.ID)
-	}
 	return hermesProviderEntry{
 		Name: magpieID, BaseURL: gw + "/v1", APIKey: keyAt(gw), APIMode: "chat_completions",
-		Headers: map[string]string{"User-Agent": "hermes-agent"}, Models: ms,
+		Headers: map[string]string{"User-Agent": "hermes-agent"}, Models: hermesModels(),
 	}
 }
 
@@ -633,6 +629,7 @@ func hermesProviderAt(gw string) hermesProviderEntry {
 // address, key, API mode and model list are magpie's (#2030), but for a
 // key the user keeps as a reference to a variable (hermesKeptKey).
 func hermesKept(at place, path string, e hermesProviderEntry) any {
+	e.Models = hermesKeptModels(path, e.Models)
 	e.APIKey = hermesKeptKey(at, path, e.APIKey)
 	if name, ok := edit.GetYAML(path, "providers."+magpieID+".name"); ok && strings.TrimSpace(name) != "" {
 		e.Name = name
